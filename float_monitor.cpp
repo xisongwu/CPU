@@ -6,8 +6,13 @@
 #include <windows.h>
 #include <shellapi.h>
 #include <pdh.h>
+#include <pdhmsg.h>
 #include <commdlg.h>
 #include <dbt.h>
+#include <gdiplus.h>
+#include <comdef.h>
+#include <wbemidl.h>
+#include <malloc.h>
 #elif defined(__linux__)
 #include <gtk/gtk.h>
 #include <fstream>
@@ -35,6 +40,8 @@ enum MetricType {
     METRIC_GPU,
     METRIC_DISK_ALL,
     METRIC_SWAP,
+    METRIC_CPU_TEMP,
+    METRIC_GPU_TEMP,
     METRIC_DISK_DYNAMIC,
     METRIC_COUNT = METRIC_DISK_DYNAMIC + 26
 };
@@ -95,7 +102,9 @@ const char* BASE_METRIC_NAMES[] = {
     "内存使用率",
     "GPU 使用率",
     "所有磁盘",
-    "交换区使用率"
+    "交换区使用率",
+    "CPU 温度",
+    "GPU 温度"
 };
 
 const char* BASE_METRIC_SHORT[] = {
@@ -103,7 +112,9 @@ const char* BASE_METRIC_SHORT[] = {
     "MEM",
     "GPU",
     "DISK",
-    "SWAP"
+    "SWAP",
+    "CPU Temp",
+    "GPU Temp"
 };
 
 const char* GetMetricName(MetricType type) {
@@ -146,6 +157,16 @@ static Settings g_settings;
 static MonitorData g_monitorData = {0};
 static double g_diskValues[26] = {0};
 
+#ifdef _WIN32
+static char g_cpuName[128] = "";
+static char g_gpuName[128] = "";
+static double g_cpuTemp = -1;  // -1 = not available
+static double g_gpuTemp = -1;
+static double g_cpuHistory[120] = {0};
+static int g_cpuHistoryIdx = 0;
+static int g_cpuHistoryLen = 0;
+#endif
+
 void InitSettings() {
     g_settings.numSlots = 2;
     g_settings.theme = THEME_DARK;
@@ -186,6 +207,10 @@ double GetMetricValue(const MonitorData& data, MetricType type) {
     case METRIC_GPU: return data.gpuUsage;
     case METRIC_DISK_ALL: return data.diskUsage;
     case METRIC_SWAP: return data.swapUsage;
+#ifdef _WIN32
+    case METRIC_CPU_TEMP: return (g_cpuTemp >= 0) ? g_cpuTemp : 0;
+    case METRIC_GPU_TEMP: return (g_gpuTemp >= 0) ? g_gpuTemp : 0;
+#endif
     default:
         if (IsDiskMetric(type)) {
             int idx = GetDiskIndex(type);
@@ -206,6 +231,25 @@ void GetUsageColor(double value, ThemeType theme, double &r, double &g, double &
         else { r=244/255.0; g=67/255.0; b=54/255.0; }
     }
 }
+
+#ifdef _WIN32
+void GetUsageColorForMetric(double value, MetricType metric, ThemeType theme, double &r, double &g, double &b) {
+    if (metric == METRIC_CPU_TEMP || metric == METRIC_GPU_TEMP) {
+        // Temperature: 0-40 green, 40-70 yellow, 70-100+ red
+        if (theme == THEME_LIGHT) {
+            if (value < 40) { r=46/255.0; g=125/255.0; b=50/255.0; }
+            else if (value < 70) { r=230/255.0; g=160/255.0; b=0; }
+            else { r=211/255.0; g=47/255.0; b=47/255.0; }
+        } else {
+            if (value < 40) { r=76/255.0; g=175/255.0; b=80/255.0; }
+            else if (value < 70) { r=255/255.0; g=193/255.0; b=7/255.0; }
+            else { r=244/255.0; g=67/255.0; b=54/255.0; }
+        }
+    } else {
+        GetUsageColor(value, theme, r, g, b);
+    }
+}
+#endif
 
 // ============================================================
 // Platform: Windows
@@ -246,6 +290,410 @@ COLORREF GetUsageColorWin(double value, ThemeType theme) {
     return RGB((int)(r*255), (int)(g*255), (int)(b*255));
 }
 
+COLORREF GetUsageColorWinForMetric(double value, MetricType metric, ThemeType theme) {
+    double r, g, b;
+    GetUsageColorForMetric(value, metric, theme, r, g, b);
+    return RGB((int)(r*255), (int)(g*255), (int)(b*255));
+}
+
+// Forward declaration
+void DrawRoundedRect(HDC hdc, RECT rect, int radius, COLORREF fillColor, COLORREF borderColor, int borderWidth);
+
+void QueryCPUName() {
+    HKEY hKey;
+    if (RegOpenKeyExA(HKEY_LOCAL_MACHINE, "HARDWARE\\DESCRIPTION\\System\\CentralProcessor\\0",
+        0, KEY_READ, &hKey) == ERROR_SUCCESS) {
+        DWORD size = sizeof(g_cpuName);
+        RegQueryValueExA(hKey, "ProcessorNameString", NULL, NULL, (LPBYTE)g_cpuName, &size);
+        RegCloseKey(hKey);
+    }
+    // 去除前后空格
+    char* p = g_cpuName;
+    while (*p == ' ') p++;
+    if (p != g_cpuName) memmove(g_cpuName, p, strlen(p) + 1);
+    int len = strlen(g_cpuName);
+    while (len > 0 && g_cpuName[len-1] == ' ') g_cpuName[--len] = '\0';
+}
+
+void QueryGPUName() {
+    DISPLAY_DEVICEA dd;
+    dd.cb = sizeof(DISPLAY_DEVICEA);
+    g_gpuName[0] = '\0';
+    for (DWORD i = 0; EnumDisplayDevicesA(NULL, i, &dd, 0); i++) {
+        if (dd.StateFlags & DISPLAY_DEVICE_ATTACHED_TO_DESKTOP) {
+            // 优先选择独显（NVIDIA/AMD），否则选集显
+            if (g_gpuName[0] == '\0') {
+                strncpy(g_gpuName, dd.DeviceString, sizeof(g_gpuName) - 1);
+            }
+            if (strstr(dd.DeviceString, "NVIDIA") || strstr(dd.DeviceString, "AMD") ||
+                strstr(dd.DeviceString, "Radeon") || strstr(dd.DeviceString, "GeForce")) {
+                strncpy(g_gpuName, dd.DeviceString, sizeof(g_gpuName) - 1);
+                break;
+            }
+        }
+    }
+}
+
+static void* __cdecl ADL_Main_Memory_AllocCb(int size) {
+    return malloc(size);
+}
+
+void QueryTemperatures() {
+    // Reset temps each query cycle - sensors may come and go
+    g_cpuTemp = -1;
+    g_gpuTemp = -1;
+
+    // CPU Temperature - try PDH Thermal Zone counter first (no admin needed)
+    static HQUERY tempPdhQuery = NULL;
+    static HCOUNTER cpuTempCounter = NULL;
+    static bool tempPdhInited = false;
+
+    if (!tempPdhInited) {
+        tempPdhInited = true;
+        if (PdhOpenQuery(NULL, 0, &tempPdhQuery) == ERROR_SUCCESS) {
+            if (PdhAddCounterA(tempPdhQuery, "\\Thermal Zone Information(*)\\Temperature", 0, &cpuTempCounter) != ERROR_SUCCESS)
+                cpuTempCounter = NULL;
+        }
+    }
+
+    if (cpuTempCounter) {
+        PdhCollectQueryData(tempPdhQuery);
+        DWORD bufSize = 0;
+        DWORD itemCount = 0;
+        PDH_STATUS pdhStatus = PdhGetFormattedCounterArray(cpuTempCounter, PDH_FMT_DOUBLE, &bufSize, &itemCount, NULL);
+        if (pdhStatus == PDH_MORE_DATA || pdhStatus == ERROR_SUCCESS) {
+            PPDH_FMT_COUNTERVALUE_ITEM items = (PPDH_FMT_COUNTERVALUE_ITEM)malloc(bufSize);
+            if (items) {
+                pdhStatus = PdhGetFormattedCounterArray(cpuTempCounter, PDH_FMT_DOUBLE, &bufSize, &itemCount, items);
+                if (pdhStatus == ERROR_SUCCESS) {
+                    for (DWORD i = 0; i < itemCount; i++) {
+                        double val = items[i].FmtValue.doubleValue;
+                        double temp = val - 273.15;
+                        if (temp > 0 && temp < 150) {
+                            if (g_cpuTemp < 0 || temp > g_cpuTemp)
+                                g_cpuTemp = temp;
+                        }
+                    }
+                }
+                free(items);
+            }
+        }
+    }
+
+    // CPU Temperature fallback - try WMI MSAcpi_ThermalZoneTemperature
+    if (g_cpuTemp < 0) {
+        static bool comInitForWmi = false;
+        if (!comInitForWmi) {
+            CoInitialize(NULL);
+            comInitForWmi = true;
+        }
+        IWbemLocator* pLoc = NULL;
+        HRESULT hr = CoCreateInstance(CLSID_WbemLocator, 0, CLSCTX_INPROC_SERVER, IID_IWbemLocator, (LPVOID*)&pLoc);
+        if (SUCCEEDED(hr)) {
+            IWbemServices* pSvc = NULL;
+            hr = pLoc->ConnectServer(_bstr_t(L"ROOT\\WMI"), NULL, NULL, 0, 0, NULL, 0, &pSvc);
+            if (SUCCEEDED(hr)) {
+                CoSetProxyBlanket(pSvc, RPC_C_AUTHN_WINNT, RPC_C_AUTHZ_NONE, NULL, RPC_C_AUTHN_LEVEL_CALL, RPC_C_IMP_LEVEL_IMPERSONATE, NULL, EOAC_NONE);
+                IEnumWbemClassObject* pEnumerator = NULL;
+                hr = pSvc->ExecQuery(_bstr_t("WQL"), _bstr_t("SELECT * FROM MSAcpi_ThermalZoneTemperature"),
+                    WBEM_FLAG_FORWARD_ONLY | WBEM_FLAG_RETURN_IMMEDIATELY, NULL, &pEnumerator);
+                if (SUCCEEDED(hr) && pEnumerator) {
+                    IWbemClassObject* pclsObj = NULL;
+                    ULONG uReturn = 0;
+                    while (pEnumerator->Next(WBEM_INFINITE, 1, &pclsObj, &uReturn) == S_OK && uReturn > 0) {
+                        VARIANT vtProp;
+                        VariantInit(&vtProp);
+                        hr = pclsObj->Get(L"CurrentTemperature", 0, &vtProp, 0, 0);
+                        if (SUCCEEDED(hr) && vtProp.vt == VT_I4) {
+                            double temp = vtProp.lVal / 10.0 - 273.15;
+                            if (temp > 0 && temp < 150) {
+                                if (g_cpuTemp < 0 || temp > g_cpuTemp)
+                                    g_cpuTemp = temp;
+                            }
+                        }
+                        VariantClear(&vtProp);
+                        pclsObj->Release();
+                    }
+                    pEnumerator->Release();
+                }
+                pSvc->Release();
+            }
+            pLoc->Release();
+        }
+    }
+
+    // CPU Temperature fallback 2 - try WMI Win32_TemperatureProbe
+    if (g_cpuTemp < 0) {
+        IWbemLocator* pLoc = NULL;
+        HRESULT hr = CoCreateInstance(CLSID_WbemLocator, 0, CLSCTX_INPROC_SERVER, IID_IWbemLocator, (LPVOID*)&pLoc);
+        if (SUCCEEDED(hr)) {
+            IWbemServices* pSvc = NULL;
+            hr = pLoc->ConnectServer(_bstr_t(L"ROOT\\CIMV2"), NULL, NULL, 0, 0, NULL, 0, &pSvc);
+            if (SUCCEEDED(hr)) {
+                CoSetProxyBlanket(pSvc, RPC_C_AUTHN_WINNT, RPC_C_AUTHZ_NONE, NULL, RPC_C_AUTHN_LEVEL_CALL, RPC_C_IMP_LEVEL_IMPERSONATE, NULL, EOAC_NONE);
+                IEnumWbemClassObject* pEnumerator = NULL;
+                hr = pSvc->ExecQuery(_bstr_t("WQL"), _bstr_t("SELECT * FROM Win32_TemperatureProbe"),
+                    WBEM_FLAG_FORWARD_ONLY | WBEM_FLAG_RETURN_IMMEDIATELY, NULL, &pEnumerator);
+                if (SUCCEEDED(hr) && pEnumerator) {
+                    IWbemClassObject* pclsObj = NULL;
+                    ULONG uReturn = 0;
+                    while (pEnumerator->Next(WBEM_INFINITE, 1, &pclsObj, &uReturn) == S_OK && uReturn > 0) {
+                        VARIANT vtProp;
+                        VariantInit(&vtProp);
+                        hr = pclsObj->Get(L"CurrentReading", 0, &vtProp, 0, 0);
+                        if (SUCCEEDED(hr) && (vtProp.vt == VT_I4 || vtProp.vt == VT_UI4)) {
+                            double temp = vtProp.lVal / 10.0; // tenths of Kelvin
+                            temp = temp - 273.15;
+                            if (temp > 0 && temp < 150) {
+                                if (g_cpuTemp < 0 || temp > g_cpuTemp)
+                                    g_cpuTemp = temp;
+                            }
+                        }
+                        VariantClear(&vtProp);
+                        pclsObj->Release();
+                    }
+                    pEnumerator->Release();
+                }
+                pSvc->Release();
+            }
+            pLoc->Release();
+        }
+    }
+
+    // GPU Temperature - try NVML (NVIDIA)
+    static HMODULE hNvml = NULL;
+    static bool nvmlTried = false;
+    if (!nvmlTried) {
+        hNvml = LoadLibraryA("nvml.dll");
+        nvmlTried = true;
+    }
+    if (hNvml) {
+        typedef int (*nvmlInit_t)(void);
+        typedef int (*nvmlDeviceGetCount_t)(unsigned int*);
+        typedef int (*nvmlDeviceGetHandleByIndex_t)(unsigned int, void**);
+        typedef int (*nvmlDeviceGetTemperature_t)(void*, int, unsigned int*);
+
+        static nvmlInit_t pNvmlInit = (nvmlInit_t)GetProcAddress(hNvml, "nvmlInit_v2");
+        static nvmlDeviceGetCount_t pNvmlDeviceGetCount = (nvmlDeviceGetCount_t)GetProcAddress(hNvml, "nvmlDeviceGetCount_v2");
+        static nvmlDeviceGetHandleByIndex_t pNvmlDeviceGetHandleByIndex = (nvmlDeviceGetHandleByIndex_t)GetProcAddress(hNvml, "nvmlDeviceGetHandleByIndex_v2");
+        static nvmlDeviceGetTemperature_t pNvmlDeviceGetTemperature = (nvmlDeviceGetTemperature_t)GetProcAddress(hNvml, "nvmlDeviceGetTemperature");
+
+        if (pNvmlInit && pNvmlDeviceGetCount && pNvmlDeviceGetHandleByIndex && pNvmlDeviceGetTemperature) {
+            static bool nvmlInited = false;
+            if (!nvmlInited) {
+                if (pNvmlInit() == 0) nvmlInited = true;
+            }
+            if (nvmlInited) {
+                unsigned int count = 0;
+                if (pNvmlDeviceGetCount(&count) == 0 && count > 0) {
+                    void* handle = NULL;
+                    if (pNvmlDeviceGetHandleByIndex(0, &handle) == 0) {
+                        unsigned int temp = 0;
+                        if (pNvmlDeviceGetTemperature(handle, 0, &temp) == 0) {
+                            g_gpuTemp = (double)temp;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // GPU Temperature - try ADL (AMD)
+    static HMODULE hAdl = NULL;
+    static bool adlTried = false;
+    if (!adlTried) {
+        hAdl = LoadLibraryA("atiadlxx.dll");
+        if (!hAdl) hAdl = LoadLibraryA("atiadlxy.dll");
+        adlTried = true;
+    }
+    if (hAdl) {
+        typedef int (*ADL_Main_Control_Create_t)(void* (*)(int), int);
+        typedef int (*ADL_Adapter_NumberOfAdapters_Get_t)(int*);
+        typedef int (*ADL_Adapter_AdapterInfo_Get_t)(void*, int);
+        typedef int (*ADL_Overdrive5_Temperature_Get_t)(int, int, void*);
+        typedef int (*ADL2_Overdrive6_Temperature_Get_t)(int, int, void*);
+
+        static ADL_Main_Control_Create_t pADL_Main_Control_Create = (ADL_Main_Control_Create_t)GetProcAddress(hAdl, "ADL_Main_Control_Create");
+        static ADL_Adapter_NumberOfAdapters_Get_t pADL_Adapter_NumberOfAdapters_Get = (ADL_Adapter_NumberOfAdapters_Get_t)GetProcAddress(hAdl, "ADL_Adapter_NumberOfAdapters_Get");
+        static ADL_Adapter_AdapterInfo_Get_t pADL_Adapter_AdapterInfo_Get = (ADL_Adapter_AdapterInfo_Get_t)GetProcAddress(hAdl, "ADL_Adapter_AdapterInfo_Get");
+        static ADL_Overdrive5_Temperature_Get_t pADL_Overdrive5_Temperature_Get = (ADL_Overdrive5_Temperature_Get_t)GetProcAddress(hAdl, "ADL_Overdrive5_Temperature_Get");
+
+        if (pADL_Main_Control_Create && pADL_Adapter_NumberOfAdapters_Get && pADL_Adapter_AdapterInfo_Get) {
+            static bool adlInited = false;
+            if (!adlInited) {
+                if (pADL_Main_Control_Create(ADL_Main_Memory_AllocCb, 1) == 0)
+                    adlInited = true;
+            }
+            if (adlInited) {
+                int numAdapters = 0;
+                if (pADL_Adapter_NumberOfAdapters_Get(&numAdapters) == 0 && numAdapters > 0) {
+                    int infoSize = numAdapters * 1024;
+                    void* adapterInfo = malloc(infoSize);
+                    if (adapterInfo) {
+                        memset(adapterInfo, 0, infoSize);
+                        if (pADL_Adapter_AdapterInfo_Get(adapterInfo, infoSize) == 0) {
+                            for (int i = 0; i < numAdapters; i++) {
+                                int adapterIndex = *((int*)((char*)adapterInfo + i * 1024 + 4));
+                                int adlTemp[2] = { 8, 0 };
+                                if (pADL_Overdrive5_Temperature_Get) {
+                                    if (pADL_Overdrive5_Temperature_Get(adapterIndex, 0, adlTemp) == 0) {
+                                        double temp = adlTemp[1] / 1000.0;
+                                        if (temp > 0 && temp < 150) {
+                                            if (g_gpuTemp < 0 || temp > g_gpuTemp)
+                                                g_gpuTemp = temp;
+                                        }
+                                    }
+                                }
+                                if (g_gpuTemp < 0) {
+                                    static ADL2_Overdrive6_Temperature_Get_t pADL2_OD6_Temp = NULL;
+                                    if (!pADL2_OD6_Temp) {
+                                        pADL2_OD6_Temp = (ADL2_Overdrive6_Temperature_Get_t)GetProcAddress(hAdl, "ADL2_Overdrive6_Temperature_Get");
+                                    }
+                                    if (pADL2_OD6_Temp) {
+                                        int od6Temp[2] = { 8, 0 };
+                                        if (pADL2_OD6_Temp(adapterIndex, 0, od6Temp) == 0) {
+                                            double temp = od6Temp[1] / 1000.0;
+                                            if (temp > 0 && temp < 150) {
+                                                if (g_gpuTemp < 0 || temp > g_gpuTemp)
+                                                    g_gpuTemp = temp;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        free(adapterInfo);
+                    }
+                }
+            }
+        }
+    }
+}
+
+void DrawCurveGraph(HDC hdc, int x, int y, int width, int height, ThemeType theme) {
+    const ThemeColors& tc = THEMES[theme];
+    if (g_cpuHistoryLen < 2) return;
+
+    // 获取当前CPU值对应的颜色
+    double curValue = g_cpuHistory[(g_cpuHistoryIdx - 1 + 120) % 120];
+    double cr, cg, cb;
+    GetUsageColor(curValue, theme, cr, cg, cb);
+    COLORREF lineColor = RGB((int)(cr*255), (int)(cg*255), (int)(cb*255));
+    COLORREF glowColor = RGB((int)(cr*255*0.5), (int)(cg*255*0.5), (int)(cb*255*0.5));
+
+    // 计算所有点坐标
+    int startIdx = (g_cpuHistoryIdx - g_cpuHistoryLen + 120) % 120;
+    int* ptsX = (int*)malloc(g_cpuHistoryLen * sizeof(int));
+    int* ptsY = (int*)malloc(g_cpuHistoryLen * sizeof(int));
+    for (int i = 0; i < g_cpuHistoryLen; i++) {
+        int idx = (startIdx + i) % 120;
+        ptsX[i] = x + (int)((double)i / (119.0) * width);
+        ptsY[i] = y + height - (int)(height * g_cpuHistory[idx] / 100.0);
+        if (ptsY[i] < y) ptsY[i] = y;
+        if (ptsY[i] > y + height) ptsY[i] = y + height;
+    }
+
+    // 绘制渐变填充区域
+    HDC fillDC = CreateCompatibleDC(hdc);
+    HBITMAP fillBmp = CreateCompatibleBitmap(hdc, width, height);
+    HBITMAP oldFillBmp = (HBITMAP)SelectObject(fillDC, fillBmp);
+
+    // 清空为透明黑色
+    RECT clearRect = {0, 0, width, height};
+    FillRect(fillDC, &clearRect, (HBRUSH)GetStockObject(BLACK_BRUSH));
+
+    // 创建渐变填充 - 从线条颜色渐变到透明
+    TRIVERTEX vert[2];
+    GRADIENT_RECT gRect;
+    vert[0].x = 0; vert[0].y = 0;
+    vert[0].Red = (WORD)(cr * 65535 * 0.25);
+    vert[0].Green = (WORD)(cg * 65535 * 0.25);
+    vert[0].Blue = (WORD)(cb * 65535 * 0.25);
+    vert[0].Alpha = 0;
+    vert[1].x = width; vert[1].y = height;
+    vert[1].Red = 0; vert[1].Green = 0; vert[1].Blue = 0; vert[1].Alpha = 0;
+    gRect.UpperLeft = 0; gRect.LowerRight = 1;
+
+    // 绘制填充多边形（从曲线到底部）
+    POINT* fillPts = (POINT*)malloc((g_cpuHistoryLen + 2) * sizeof(POINT));
+    for (int i = 0; i < g_cpuHistoryLen; i++) {
+        fillPts[i].x = ptsX[i] - x;
+        fillPts[i].y = ptsY[i] - y;
+    }
+    fillPts[g_cpuHistoryLen].x = ptsX[g_cpuHistoryLen - 1] - x;
+    fillPts[g_cpuHistoryLen].y = height;
+    fillPts[g_cpuHistoryLen + 1].x = ptsX[0] - x;
+    fillPts[g_cpuHistoryLen + 1].y = height;
+
+    HRGN fillRgn = CreatePolygonRgn(fillPts, g_cpuHistoryLen + 2, ALTERNATE);
+    SelectClipRgn(fillDC, fillRgn);
+    GradientFill(fillDC, vert, 2, &gRect, 1, GRADIENT_FILL_RECT_V);
+    SelectClipRgn(fillDC, NULL);
+    DeleteObject(fillRgn);
+
+    // AlphaBlend 填充区域到主DC
+    BLENDFUNCTION bf = {AC_SRC_OVER, 0, 80, 0};
+    AlphaBlend(hdc, x, y, width, height, fillDC, 0, 0, width, height, bf);
+
+    SelectObject(fillDC, oldFillBmp);
+    DeleteObject(fillBmp);
+    DeleteDC(fillDC);
+    free(fillPts);
+
+    // 绘制发光效果（外层粗线）
+    for (int glow = 3; glow >= 1; glow--) {
+        HPEN glowPen = CreatePen(PS_SOLID, glow * 2 + 1, glowColor);
+        HPEN oldGlowPen = (HPEN)SelectObject(hdc, glowPen);
+        bool first = true;
+        for (int i = 0; i < g_cpuHistoryLen; i++) {
+            if (first) { MoveToEx(hdc, ptsX[i], ptsY[i], NULL); first = false; }
+            else LineTo(hdc, ptsX[i], ptsY[i]);
+        }
+        SelectObject(hdc, oldGlowPen);
+        DeleteObject(glowPen);
+    }
+
+    // 绘制主曲线线条（抗锯齿效果通过多层细线模拟）
+    for (int w = 2; w >= 1; w--) {
+        COLORREF c = (w == 2) ? RGB((int)(cr*255*0.7+80), (int)(cg*255*0.7+80), (int)(cb*255*0.7+80)) : lineColor;
+        HPEN linePen = CreatePen(PS_SOLID, w, c);
+        HPEN oldLinePen = (HPEN)SelectObject(hdc, linePen);
+        bool first = true;
+        for (int i = 0; i < g_cpuHistoryLen; i++) {
+            if (first) { MoveToEx(hdc, ptsX[i], ptsY[i], NULL); first = false; }
+            else LineTo(hdc, ptsX[i], ptsY[i]);
+        }
+        SelectObject(hdc, oldLinePen);
+        DeleteObject(linePen);
+    }
+
+    // 绘制当前值高亮小点（仅2px，不遮挡折线）
+    int lastX = ptsX[g_cpuHistoryLen - 1];
+    int lastY = ptsY[g_cpuHistoryLen - 1];
+    HBRUSH dotBrush = CreateSolidBrush(lineColor);
+    HBRUSH oldBrush = (HBRUSH)SelectObject(hdc, dotBrush);
+    Ellipse(hdc, lastX - 1, lastY - 1, lastX + 1, lastY + 1);
+    SelectObject(hdc, oldBrush);
+    DeleteObject(dotBrush);
+
+    // 绘制Y轴刻度标签（0%, 50%, 100%）
+    HFONT smallFont = GetSystemUIFont(-4, false);
+    HFONT oldFont = (HFONT)SelectObject(hdc, smallFont);
+    SetTextColor(hdc, RGB((int)(tc.labelR*255*0.5), (int)(tc.labelG*255*0.5), (int)(tc.labelB*255*0.5)));
+    SetBkMode(hdc, TRANSPARENT);
+    const char* labels[] = {"100", "50", "0"};
+    int labelY[] = {y, y + height / 2, y + height - 8};
+    for (int i = 0; i < 3; i++) {
+        RECT r = {x - 22, labelY[i] - 6, x - 2, labelY[i] + 6};
+        DrawTextA(hdc, labels[i], -1, &r, DT_RIGHT | DT_VCENTER);
+    }
+    SelectObject(hdc, oldFont);
+    DeleteObject(smallFont);
+
+    free(ptsX);
+    free(ptsY);
+}
+
 void DrawRoundedRect(HDC hdc, RECT rect, int radius, COLORREF fillColor, COLORREF borderColor, int borderWidth) {
     HBRUSH fillBrush = CreateSolidBrush(fillColor);
     HPEN borderPen = CreatePen(PS_SOLID, borderWidth, borderColor);
@@ -273,13 +721,29 @@ void DrawProgressBar(HDC hdc, int x, int y, int width, int height, double value,
 }
 
 void UpdateWindowSize(HWND hwnd) {
-    int windowWidth = 200;
-    int rowHeight = 44;
+    int windowWidth = 220;
+    int rowHeight = 48;
     int topMargin = 12;
     int bottomMargin = 10;
-    int windowHeight = topMargin + g_settings.numSlots * rowHeight + bottomMargin;
+    int graphHeight = 55;
+    int graphGap = 5;
+    int windowHeight = topMargin + g_settings.numSlots * rowHeight + graphGap + graphHeight + bottomMargin;
     int screenWidth = GetSystemMetrics(SM_CXSCREEN);
     SetWindowPos(hwnd, NULL, screenWidth - windowWidth - 15, 15, windowWidth, windowHeight, SWP_NOZORDER);
+}
+
+static ULONG_PTR g_gdiplusToken = 0;
+
+void InitGdiplus() {
+    Gdiplus::GdiplusStartupInput si;
+    Gdiplus::GdiplusStartup(&g_gdiplusToken, &si, NULL);
+}
+
+void ShutdownGdiplus() {
+    if (g_gdiplusToken) {
+        Gdiplus::GdiplusShutdown(g_gdiplusToken);
+        g_gdiplusToken = 0;
+    }
 }
 
 void LoadBgBitmap() {
@@ -287,7 +751,11 @@ void LoadBgBitmap() {
     wchar_t wpath[512];
     MultiByteToWideChar(CP_UTF8, 0, g_settings.bgPath, -1, wpath, 512);
     if (wpath[0] != L'\0') {
-        g_bgBitmap = (HBITMAP)LoadImageW(NULL, wpath, IMAGE_BITMAP, 0, 0, LR_LOADFROMFILE);
+        Gdiplus::Bitmap* bitmap = Gdiplus::Bitmap::FromFile(wpath);
+        if (bitmap && bitmap->GetLastStatus() == Gdiplus::Ok) {
+            bitmap->GetHBITMAP(Gdiplus::Color(0, 0, 0), &g_bgBitmap);
+        }
+        delete bitmap;
     }
 }
 
@@ -495,16 +963,74 @@ LRESULT CALLBACK SettingsProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
     return 0;
 }
 
+// PDH counters management functions - extracted to eliminate code duplication
+static HQUERY pdhQuery = NULL;
+static HCOUNTER gpuCounter = NULL;
+static HCOUNTER diskCounters[26] = {NULL};
+static HCOUNTER diskAllCounter = NULL;
+static bool pdhReady = false;
+
+void CleanupPdhCounters() {
+    if (gpuCounter) {
+        PdhRemoveCounter(gpuCounter);
+        gpuCounter = NULL;
+    }
+    if (diskAllCounter) {
+        PdhRemoveCounter(diskAllCounter);
+        diskAllCounter = NULL;
+    }
+    for (int i = 0; i < 26; i++) {
+        if (diskCounters[i]) {
+            PdhRemoveCounter(diskCounters[i]);
+            diskCounters[i] = NULL;
+        }
+    }
+    if (pdhQuery) {
+        PdhCloseQuery(pdhQuery);
+        pdhQuery = NULL;
+    }
+    pdhReady = false;
+}
+
+bool InitializePdhCounters() {
+    CleanupPdhCounters();  // Ensure old resources are cleaned up first
+    
+    PDH_STATUS status = PdhOpenQuery(NULL, 0, &pdhQuery);
+    if (status != ERROR_SUCCESS) {
+        pdhReady = false;
+        return false;
+    }
+    
+    // Add GPU counter
+    if (PdhAddCounterA(pdhQuery, "\\GPU Engine(*)\\Utilization Percentage", 0, &gpuCounter) != ERROR_SUCCESS) {
+        gpuCounter = NULL;
+    }
+    
+    // Add total disk counter
+    if (PdhAddCounterA(pdhQuery, "\\PhysicalDisk(_Total)\\% Disk Time", 0, &diskAllCounter) != ERROR_SUCCESS) {
+        diskAllCounter = NULL;
+    }
+    
+    // Add individual disk counters
+    for (int i = 0; i < g_diskCount; i++) {
+        char counterPath[128];
+        sprintf(counterPath, "\\LogicalDisk(%c:)\\%% Disk Time", g_disks[i].letter);
+        if (PdhAddCounterA(pdhQuery, counterPath, 0, &diskCounters[i]) != ERROR_SUCCESS) {
+            diskCounters[i] = NULL;
+        }
+    }
+    
+    // Collect initial data
+    PdhCollectQueryData(pdhQuery);
+    pdhReady = true;
+    return true;
+}
+
 LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     static FILETIME prevIdleTime = {0};
     static FILETIME prevKernelTime = {0};
     static FILETIME prevUserTime = {0};
     static ULONGLONG totalPhys = 0;
-    static HQUERY pdhQuery = NULL;
-    static HCOUNTER gpuCounter = NULL;
-    static HCOUNTER diskCounters[26] = {NULL};
-    static HCOUNTER diskAllCounter = NULL;
-    static bool pdhReady = false;
     static bool isHovering = false;
 
     switch (msg) {
@@ -513,19 +1039,9 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         memStatus.dwLength = sizeof(MEMORYSTATUSEX);
         if (GlobalMemoryStatusEx(&memStatus)) totalPhys = memStatus.ullTotalPhys;
         GetSystemTimes(&prevIdleTime, &prevKernelTime, &prevUserTime);
-        PDH_STATUS status = PdhOpenQuery(NULL, 0, &pdhQuery);
-        if (status == ERROR_SUCCESS) {
-            if (PdhAddCounterA(pdhQuery, "\\GPU Engine(*)\\Utilization Percentage", 0, &gpuCounter) != ERROR_SUCCESS) gpuCounter = NULL;
-            if (PdhAddCounterA(pdhQuery, "\\PhysicalDisk(_Total)\\% Disk Time", 0, &diskAllCounter) != ERROR_SUCCESS) diskAllCounter = NULL;
-            for (int i = 0; i < g_diskCount; i++) {
-                char counterPath[128];
-                sprintf(counterPath, "\\LogicalDisk(%c:)\\%% Disk Time", g_disks[i].letter);
-                if (PdhAddCounterA(pdhQuery, counterPath, 0, &diskCounters[i]) != ERROR_SUCCESS)
-                    diskCounters[i] = NULL;
-            }
-            PdhCollectQueryData(pdhQuery);
-            pdhReady = true;
-        }
+        InitializePdhCounters();
+        QueryCPUName();
+        QueryGPUName();
         LoadBgBitmap();
         SetTimer(hwnd, TIMER_ID, 1000, NULL);
         break;
@@ -544,6 +1060,12 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         ULONGLONG totalDiff = kernelDiff + userDiff;
         if (totalDiff > 0) g_monitorData.cpuUsage = (100.0 - (idleDiff * 100.0 / totalDiff));
         prevIdleTime = idleTime; prevKernelTime = kernelTime; prevUserTime = userTime;
+
+        // 记录CPU历史
+        g_cpuHistory[g_cpuHistoryIdx] = g_monitorData.cpuUsage;
+        g_cpuHistoryIdx = (g_cpuHistoryIdx + 1) % 120;
+        if (g_cpuHistoryLen < 120) g_cpuHistoryLen++;
+
         MEMORYSTATUSEX memStatus;
         memStatus.dwLength = sizeof(MEMORYSTATUSEX);
         if (GlobalMemoryStatusEx(&memStatus) && totalPhys > 0) {
@@ -554,11 +1076,23 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         if (pdhReady) {
             PdhCollectQueryData(pdhQuery);
             if (gpuCounter) {
-                PDH_FMT_COUNTERVALUE cv;
-                if (PdhGetFormattedCounterValue(gpuCounter, PDH_FMT_DOUBLE, NULL, &cv) == ERROR_SUCCESS) {
-                    g_monitorData.gpuUsage = cv.doubleValue;
-                    if (g_monitorData.gpuUsage < 0) g_monitorData.gpuUsage = 0;
-                    if (g_monitorData.gpuUsage > 100) g_monitorData.gpuUsage = 100;
+                DWORD bufSize = 0;
+                DWORD itemCount = 0;
+                PDH_STATUS pdhStatus = PdhGetFormattedCounterArray(gpuCounter, PDH_FMT_DOUBLE, &bufSize, &itemCount, NULL);
+                if (pdhStatus == PDH_MORE_DATA || pdhStatus == ERROR_SUCCESS) {
+                    PPDH_FMT_COUNTERVALUE_ITEM items = (PPDH_FMT_COUNTERVALUE_ITEM)malloc(bufSize);
+                    if (items) {
+                        pdhStatus = PdhGetFormattedCounterArray(gpuCounter, PDH_FMT_DOUBLE, &bufSize, &itemCount, items);
+                        if (pdhStatus == ERROR_SUCCESS) {
+                            double maxGpu = 0;
+                            for (DWORD i = 0; i < itemCount; i++) {
+                                double val = items[i].FmtValue.doubleValue;
+                                if (val > maxGpu && val <= 100) maxGpu = val;
+                            }
+                            g_monitorData.gpuUsage = maxGpu;
+                        }
+                        free(items);
+                    }
                 }
             }
             if (diskAllCounter) {
@@ -580,6 +1114,13 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 }
             }
         }
+        // 温度查询（每5秒一次，避免频繁WMI调用）
+        static int tempTimer = 0;
+        tempTimer++;
+        if (tempTimer >= 5) {
+            tempTimer = 0;
+            QueryTemperatures();
+        }
         InvalidateRect(hwnd, NULL, TRUE);
         break;
     }
@@ -592,33 +1133,9 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 char oldLetters[26];
                 for (int i = 0; i < oldCount; i++) oldLetters[i] = g_disks[i].letter;
 
-                if (gpuCounter) PdhRemoveCounter(gpuCounter);
-                if (diskAllCounter) PdhRemoveCounter(diskAllCounter);
-                for (int i = 0; i < oldCount; i++) {
-                    if (diskCounters[i]) PdhRemoveCounter(diskCounters[i]);
-                    diskCounters[i] = NULL;
-                }
-                if (pdhQuery) PdhCloseQuery(pdhQuery);
-                pdhQuery = NULL;
-                gpuCounter = NULL;
-                diskAllCounter = NULL;
-                pdhReady = false;
-
+                CleanupPdhCounters();
                 DetectDisks();
-
-                PDH_STATUS status = PdhOpenQuery(NULL, 0, &pdhQuery);
-                if (status == ERROR_SUCCESS) {
-                    if (PdhAddCounterA(pdhQuery, "\\GPU Engine(*)\\Utilization Percentage", 0, &gpuCounter) != ERROR_SUCCESS) gpuCounter = NULL;
-                    if (PdhAddCounterA(pdhQuery, "\\PhysicalDisk(_Total)\\% Disk Time", 0, &diskAllCounter) != ERROR_SUCCESS) diskAllCounter = NULL;
-                    for (int i = 0; i < g_diskCount; i++) {
-                        char counterPath[128];
-                        sprintf(counterPath, "\\LogicalDisk(%c:)\\%% Disk Time", g_disks[i].letter);
-                        if (PdhAddCounterA(pdhQuery, counterPath, 0, &diskCounters[i]) != ERROR_SUCCESS)
-                            diskCounters[i] = NULL;
-                    }
-                    PdhCollectQueryData(pdhQuery);
-                    pdhReady = true;
-                }
+                InitializePdhCounters();
             }
         }
         break;
@@ -673,26 +1190,97 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         const ThemeColors& tc = THEMES[g_settings.theme];
         COLORREF bgColor = isHovering ? RGB(tc.bgHoverR*255, tc.bgHoverG*255, tc.bgHoverB*255) : RGB(tc.bgR*255, tc.bgG*255, tc.bgB*255);
         COLORREF borderColor = isHovering ? RGB(tc.borderHoverR*255, tc.borderHoverG*255, tc.borderHoverB*255) : RGB(tc.borderR*255, tc.borderG*255, tc.borderB*255);
-        DrawRoundedRect(hdc, rect, 12, bgColor, borderColor, 1);
+
+        if (g_bgBitmap) {
+            HDC memDC = CreateCompatibleDC(hdc);
+            HBITMAP oldBmp = (HBITMAP)SelectObject(memDC, g_bgBitmap);
+            BITMAP bm;
+            GetObject(g_bgBitmap, sizeof(bm), &bm);
+            SetStretchBltMode(hdc, HALFTONE);
+            StretchBlt(hdc, 0, 0, rect.right, rect.bottom, memDC, 0, 0, bm.bmWidth, bm.bmHeight, SRCCOPY);
+            SelectObject(memDC, oldBmp);
+            DeleteDC(memDC);
+
+            HDC blendDC = CreateCompatibleDC(hdc);
+            HBITMAP blendBmp = CreateCompatibleBitmap(hdc, rect.right, rect.bottom);
+            HBITMAP oldBlend = (HBITMAP)SelectObject(blendDC, blendBmp);
+            DrawRoundedRect(blendDC, rect, 12, bgColor, borderColor, 1);
+            BLENDFUNCTION bf = {AC_SRC_OVER, 0, 160, 0};
+            AlphaBlend(hdc, 0, 0, rect.right, rect.bottom, blendDC, 0, 0, rect.right, rect.bottom, bf);
+            SelectObject(blendDC, oldBlend);
+            DeleteObject(blendBmp);
+            DeleteDC(blendDC);
+        } else {
+            DrawRoundedRect(hdc, rect, 12, bgColor, borderColor, 1);
+        }
         HFONT labelFont = GetSystemUIFont(0, false);
         HFONT valueFont = GetSystemUIFont(1, true);
         for (int i = 0; i < g_settings.numSlots; i++) {
             MetricType metric = g_settings.slots[i];
             double value = GetMetricValue(g_monitorData, metric);
-            COLORREF valueColor = GetUsageColorWin(value, g_settings.theme);
-            int yPos = 12 + i * 44;
+            COLORREF valueColor = GetUsageColorWinForMetric(value, metric, g_settings.theme);
+            int yPos = 12 + i * 48;
+
+            // 标签
             SelectObject(hdc, labelFont);
             SetTextColor(hdc, RGB(tc.labelR*255, tc.labelG*255, tc.labelB*255));
             SetBkMode(hdc, TRANSPARENT);
             RECT labelRect = {15, yPos, 75, yPos + 16};
             DrawTextA(hdc, GetMetricShort(metric), -1, &labelRect, DT_LEFT | DT_VCENTER);
+
+            // 数值
             SelectObject(hdc, valueFont);
             SetTextColor(hdc, valueColor);
-            char valueBuf[20]; sprintf(valueBuf, "%.1f%%", value);
-            RECT valueRect = {rect.right - 55, yPos, rect.right - 15, yPos + 16};
-            DrawTextA(hdc, valueBuf, -1, &valueRect, DT_RIGHT | DT_VCENTER);
-            DrawProgressBar(hdc, 15, yPos + 22, rect.right - 30, 6, value, RGB(tc.trackR*255, tc.trackG*255, tc.trackB*255), RGB(tc.trackBorderR*255, tc.trackBorderG*255, tc.trackBorderB*255), g_settings.theme);
+            RECT valueRect = {rect.right - 60, yPos, rect.right - 15, yPos + 16};
+            if (metric == METRIC_CPU_TEMP || metric == METRIC_GPU_TEMP) {
+                double temp = (metric == METRIC_CPU_TEMP) ? g_cpuTemp : g_gpuTemp;
+                wchar_t wValueBuf[32];
+                if (temp >= 0) swprintf(wValueBuf, 32, L"%.0f\u00B0C", temp);
+                else wcscpy(wValueBuf, L"N/A");
+                DrawTextW(hdc, wValueBuf, -1, &valueRect, DT_RIGHT | DT_VCENTER);
+            } else {
+                char valueBuf[32];
+                sprintf(valueBuf, "%.1f%%", value);
+                DrawTextA(hdc, valueBuf, -1, &valueRect, DT_RIGHT | DT_VCENTER);
+            }
+
+            // 型号名和温度（仅 CPU/GPU 栏目）
+            if (metric == METRIC_CPU || metric == METRIC_GPU) {
+                HFONT smallFont = GetSystemUIFont(-3, false);
+                SelectObject(hdc, smallFont);
+                SetTextColor(hdc, RGB((int)(tc.labelR*255*0.7), (int)(tc.labelG*255*0.7), (int)(tc.labelB*255*0.7)));
+                wchar_t wInfoBuf[128] = L"";
+                const char* name = (metric == METRIC_CPU) ? g_cpuName : g_gpuName;
+                double temp = (metric == METRIC_CPU) ? g_cpuTemp : g_gpuTemp;
+                if (name[0]) {
+                    wchar_t wName[64] = L"";
+                    MultiByteToWideChar(CP_UTF8, 0, name, -1, wName, 64);
+                    wcsncpy(wInfoBuf, wName, 60);
+                    wInfoBuf[60] = L'\0';
+                }
+                if (temp >= 0) {
+                    wchar_t wTempBuf[16];
+                    swprintf(wTempBuf, 16, L" %.0f\u00B0C", temp);
+                    wcscat(wInfoBuf, wTempBuf);
+                }
+                if (wInfoBuf[0]) {
+                    RECT infoRect = {15, yPos + 16, rect.right - 15, yPos + 28};
+                    DrawTextW(hdc, wInfoBuf, -1, &infoRect, DT_LEFT | DT_VCENTER);
+                }
+                DeleteObject(smallFont);
+            }
+
+            // 进度条（温度栏目也显示进度条，范围0-100°C）
+            double barValue = (metric == METRIC_CPU_TEMP || metric == METRIC_GPU_TEMP) ? (value > 100 ? 100 : value) : value;
+            DrawProgressBar(hdc, 15, yPos + 32, rect.right - 30, 6,
+                barValue, RGB(tc.trackR*255, tc.trackG*255, tc.trackB*255),
+                RGB(tc.trackBorderR*255, tc.trackBorderG*255, tc.trackBorderB*255), g_settings.theme);
         }
+
+        // 绘制CPU曲线图
+        int graphY = 12 + g_settings.numSlots * 48 + 5;
+        DrawCurveGraph(hdc, 15, graphY, rect.right - 30, 50, g_settings.theme);
+
         DeleteObject(labelFont); DeleteObject(valueFont);
         EndPaint(hwnd, &ps);
         break;
@@ -707,6 +1295,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         if (pdhQuery) PdhCloseQuery(pdhQuery);
         if (g_bgBitmap) { DeleteObject(g_bgBitmap); g_bgBitmap = NULL; }
         if (g_uiFont) { DeleteObject(g_uiFont); g_uiFont = NULL; }
+        ShutdownGdiplus();
         DestroyTrayIcon(hwnd);
         PostQuitMessage(0);
         break;
@@ -837,6 +1426,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     g_hInstance = hInstance;
     InitSettings();
     DetectDisks();
+    InitGdiplus();
     g_uiFont = GetSystemUIFont(0, false);
 
     WNDCLASSW wc = {0};
@@ -887,7 +1477,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
 
     HWND hwnd = CreateWindowExW(WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_LAYERED,
         L"FloatMonitor", L"", WS_POPUP | WS_SYSMENU,
-        screenWidth - 215, 15, 200, 110, NULL, NULL, hInstance, NULL);
+        screenWidth - 235, 15, 220, 200, NULL, NULL, hInstance, NULL);
     SetLayeredWindowAttributes(hwnd, 0, 235, LWA_ALPHA);
     UpdateWindowSize(hwnd);
     ShowWindow(hwnd, SW_SHOW);
